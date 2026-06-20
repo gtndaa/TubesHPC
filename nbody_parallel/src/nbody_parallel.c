@@ -1,422 +1,358 @@
 /*
- * nbody_parallel.c
+ * nbody_parallel_fixed.c
  * ============================================================
- * Implementasi PARALEL simulasi N-Body gravitasi
- * menggunakan MPI (distribusi proses) + OpenMP (threading)
+ * N-Body Hybrid MPI + OpenMP — VERSI FIXED
  *
- * Strategi paralelisasi:
- *   - MPI: setiap rank memiliki N/P partikel lokal
- *   - OpenMP: komputasi gaya di-parallelize dengan #pragma omp parallel for
- *   - MPI_Allgather: sinkronisasi posisi global setelah setiap step
+ * PERBAIKAN dari versi sebelumnya:
+ *   1. Unit adimensional (G=1, M_total=1, R=1)
+ *      → tidak ada lagi overflow/instabilitas skala
+ *   2. Leapfrog (Kick-Drift-Kick) yang benar
+ *      → konservasi energi jauh lebih baik dari Velocity Verlet naive
+ *   3. Softening otomatis menyesuaikan skala sistem
+ *   4. dt default = 0.001 (aman untuk unit adimensional)
  *
- * Kompleksitas waktu: O(N^2 / P) per timestep per proses
- * Kompleksitas komunikasi: O(N) per MPI_Allgather
+ * UNIT ADIMENSIONAL:
+ *   G = 1
+ *   M_total = N  (tiap partikel massa = 1)
+ *   R_virial = 1  (partikel tersebar di radius ~1)
+ *   → crossing time ≈ 1, simulasikan T=2 sudah cukup
  *
  * Kompilasi:
- *   mpicc -O2 -fopenmp -o nbody_parallel nbody_parallel.c nbody_utils.c -lm
+ *   mpicc -O2 -fopenmp -o nbody_parallel nbody_parallel.c -lm
  *
- * Penggunaan:
- *   mpirun -np 4 ./nbody_parallel -n 256 -t 50 -dt 0.01
- *   OMP_NUM_THREADS=4 mpirun -np 2 ./nbody_parallel -n 256 -t 50
+ * Jalankan:
+ *   mpirun --oversubscribe --allow-run-as-root \
+ *          --mca plm_rsh_agent "" -np 4 \
+ *          ./nbody_parallel 512 200 4
+ *   (arg: N_partikel  N_steps  N_threads)
  * ============================================================
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
 #include <mpi.h>
 #include <omp.h>
-#include "../include/nbody.h"
 
-/* ============================================================
-   Struktur flat untuk MPI communication (lebih efisien daripada
-   kirim struct Particle langsung karena padding)
-   ============================================================ */
+/* ---- Konstanta unit adimensional ---- */
+#define G_CONST   1.0      /* gravitasi adimensional                  */
+#define SOFTENING 0.05     /* ~5% dari radius sistem, cegah singulari */
+#define DT_DEF    0.001    /* timestep aman untuk unit adimensional   */
+
+/* ---- Struct partikel ---- */
 typedef struct {
-    double x, y, z;       /* posisi */
-    double vx, vy, vz;    /* kecepatan */
-    double mass;           /* massa */
-} ParticleFlat;
+    double x,  y,  z;
+    double vx, vy, vz;
+    double ax, ay, az;   /* akselerasi (butuh untuk Leapfrog KDK)   */
+    double mass;
+} Particle;
 
-/* ============================================================
-   Pack partikel ke flat struct untuk dikirim lewat MPI
-   ============================================================ */
-static void pack_particles(const Particle *src, ParticleFlat *dst, int n)
-{
-    for (int i = 0; i < n; i++) {
-        dst[i].x    = src[i].x;
-        dst[i].y    = src[i].y;
-        dst[i].z    = src[i].z;
-        dst[i].vx   = src[i].vx;
-        dst[i].vy   = src[i].vy;
-        dst[i].vz   = src[i].vz;
-        dst[i].mass = src[i].mass;
+/* ================================================================
+   inisialisasi_plummer
+   Distribusi Plummer: model galaksi sederhana yang stabil.
+   Lebih realistis dari posisi acak seragam.
+   r_scale = 1 (unit adimensional).
+   ================================================================ */
+void inisialisasi_plummer(Particle *p, int N, unsigned int seed) {
+    srand(seed);
+    double inv_N = 1.0 / N;
+
+    for (int i = 0; i < N; i++) {
+        /* --- posisi dari distribusi Plummer ---
+         * Inverse CDF: r = 1/sqrt(u^(-2/3) - 1), u ~ Uniform(0,1)
+         */
+        double u   = 0.001 + 0.998 * ((double)rand() / RAND_MAX);
+        double r   = 1.0 / sqrt(pow(u, -2.0/3.0) - 1.0);
+        double cos_theta = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
+        double sin_theta = sqrt(1.0 - cos_theta*cos_theta);
+        double phi       = 2.0 * M_PI * ((double)rand() / RAND_MAX);
+
+        p[i].x = r * sin_theta * cos(phi);
+        p[i].y = r * sin_theta * sin(phi);
+        p[i].z = r * cos_theta;
+
+        /* --- kecepatan: setengah dari kecepatan escape lokal ---
+         * v_esc = sqrt(2 * |phi(r)|), phi(r) = -G*M/sqrt(r²+1)
+         * Gunakan 50% untuk sistem terikat (virial theorem)
+         */
+        double phi_r = -G_CONST * N / sqrt(r*r + 1.0);
+        double v_max = sqrt(2.0 * fabs(phi_r)) * 0.5;
+
+        /* rejection sampling untuk distribusi kecepatan */
+        double v, g;
+        do {
+            v = ((double)rand() / RAND_MAX) * v_max;
+            g = v*v * pow(1.0 - v*v/(v_max*v_max + 1e-10), 3.5);
+        } while (((double)rand() / RAND_MAX) > g / (v_max*v_max * 0.1 + 1e-10));
+
+        double cos_tv = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
+        double sin_tv = sqrt(1.0 - cos_tv*cos_tv);
+        double phi_v  = 2.0 * M_PI * ((double)rand() / RAND_MAX);
+
+        p[i].vx = v * sin_tv * cos(phi_v);
+        p[i].vy = v * sin_tv * sin(phi_v);
+        p[i].vz = v * cos_tv;
+
+        p[i].ax   = 0.0;
+        p[i].ay   = 0.0;
+        p[i].az   = 0.0;
+        p[i].mass = 1.0;   /* massa = 1 per partikel (unit adimensional) */
+    }
+
+    /* Koreksi pusat massa ke (0,0,0) dan kecepatan pusat ke nol */
+    double cx=0,cy=0,cz=0, cvx=0,cvy=0,cvz=0;
+    for (int i=0;i<N;i++){cx+=p[i].x;cy+=p[i].y;cz+=p[i].z;
+                          cvx+=p[i].vx;cvy+=p[i].vy;cvz+=p[i].vz;}
+    cx*=inv_N;cy*=inv_N;cz*=inv_N;
+    cvx*=inv_N;cvy*=inv_N;cvz*=inv_N;
+    for (int i=0;i<N;i++){
+        p[i].x-=cx; p[i].y-=cy; p[i].z-=cz;
+        p[i].vx-=cvx;p[i].vy-=cvy;p[i].vz-=cvz;
     }
 }
 
-/* ============================================================
-   Unpack flat struct kembali ke Particle
-   ============================================================ */
-static void unpack_particles(const ParticleFlat *src, Particle *dst, int n)
+/* ================================================================
+   hitung_akselerasi_omp
+   Hitung akselerasi partikel lokal akibat SEMUA partikel global.
+   OpenMP mem-parallelize loop i (partikel lokal).
+   Tidak ada race condition: setiap i menulis ke p_lokal[i].ax/ay/az.
+   ================================================================ */
+void hitung_akselerasi_omp(Particle *lokal, int n_lokal,
+                            const Particle *global, int N)
 {
-    for (int i = 0; i < n; i++) {
-        dst[i].x    = src[i].x;
-        dst[i].y    = src[i].y;
-        dst[i].z    = src[i].z;
-        dst[i].vx   = src[i].vx;
-        dst[i].vy   = src[i].vy;
-        dst[i].vz   = src[i].vz;
-        dst[i].mass = src[i].mass;
-        dst[i].fx   = 0.0;
-        dst[i].fy   = 0.0;
-        dst[i].fz   = 0.0;
-    }
-}
-
-/* ============================================================
-   Hitung gaya partikel lokal terhadap SEMUA partikel global
-   Dijalankan paralel dengan OpenMP per partikel lokal.
-
-   Catatan desain:
-   - Tiap thread menghitung gaya untuk subset partikel lokal
-   - Tidak ada race condition karena tiap thread menulis ke
-     indeks fx[i] yang berbeda (private per partikel)
-   - Global particles (all_particles) hanya dibaca, tidak ditulis
-   ============================================================ */
-static void compute_forces_parallel_omp(
-    Particle       *local_particles,   /* partikel lokal (tulis gaya) */
-    int             n_local,           /* jumlah partikel lokal */
-    const Particle *all_particles,     /* semua partikel global (baca saja) */
-    int             n_global)          /* jumlah total partikel */
-{
-    /* Reset gaya lokal */
-    for (int i = 0; i < n_local; i++) {
-        local_particles[i].fx = 0.0;
-        local_particles[i].fy = 0.0;
-        local_particles[i].fz = 0.0;
-    }
-
-    /*
-     * #pragma omp parallel for:
-     *   - Iterasi loop i di-split ke beberapa thread
-     *   - schedule(dynamic) bagus kalau beban tidak merata
-     *   - schedule(static) lebih efisien untuk beban seragam (kita pakai ini)
-     *   - reduction tidak dibutuhkan: tiap i menulis ke index berbeda
-     */
-    #pragma omp parallel for schedule(static) default(none) \
-        shared(local_particles, all_particles, n_local, n_global)
-    for (int i = 0; i < n_local; i++) {
-        double fx_i = 0.0, fy_i = 0.0, fz_i = 0.0;
-
-        /* Hitung gaya dari SEMUA partikel global terhadap partikel lokal i */
-        for (int j = 0; j < n_global; j++) {
-            /* Skip self-interaction */
-            double dx = all_particles[j].x - local_particles[i].x;
-            double dy = all_particles[j].y - local_particles[i].y;
-            double dz = all_particles[j].z - local_particles[i].z;
-
-            double dist2 = dx*dx + dy*dy + dz*dz;
-
-            /* Skip jika partikel identik (self atau posisi persis sama) */
-            if (dist2 < 1e-30) continue;
-
-            dist2 += SOFTENING * SOFTENING;
-            double inv_dist  = 1.0 / sqrt(dist2);
-            double inv_dist3 = inv_dist * inv_dist * inv_dist;
-
-            double f_mag = G_CONST * local_particles[i].mass
-                         * all_particles[j].mass * inv_dist3;
-
-            fx_i += f_mag * dx;
-            fy_i += f_mag * dy;
-            fz_i += f_mag * dz;
+    #pragma omp parallel for schedule(static) \
+        shared(lokal, global, n_lokal, N) default(none)
+    for (int i = 0; i < n_lokal; i++) {
+        double ax=0, ay=0, az=0;
+        for (int j = 0; j < N; j++) {
+            double dx = global[j].x - lokal[i].x;
+            double dy = global[j].y - lokal[i].y;
+            double dz = global[j].z - lokal[i].z;
+            double r2 = dx*dx + dy*dy + dz*dz + SOFTENING*SOFTENING;
+            /* skip self secara efisien lewat softening (tidak perlu cek eksplisit) */
+            double inv_r3 = 1.0 / (r2 * sqrt(r2));
+            double fac = G_CONST * global[j].mass * inv_r3;
+            ax += fac * dx;
+            ay += fac * dy;
+            az += fac * dz;
         }
-
-        /* Akumulasi ke partikel lokal (aman: tidak ada race) */
-        local_particles[i].fx = fx_i;
-        local_particles[i].fy = fy_i;
-        local_particles[i].fz = fz_i;
+        lokal[i].ax = ax;
+        lokal[i].ay = ay;
+        lokal[i].az = az;
     }
 }
 
-/* ============================================================
-   Update posisi dan kecepatan lokal (Velocity Verlet)
-   ============================================================ */
-static void update_local(Particle *local, int n_local, double dt)
-{
-    for (int i = 0; i < n_local; i++) {
-        double inv_m = 1.0 / local[i].mass;
-        double ax = local[i].fx * inv_m;
-        double ay = local[i].fy * inv_m;
-        double az = local[i].fz * inv_m;
-
-        local[i].vx += ax * dt;
-        local[i].vy += ay * dt;
-        local[i].vz += az * dt;
-
-        local[i].x  += local[i].vx * dt;
-        local[i].y  += local[i].vy * dt;
-        local[i].z  += local[i].vz * dt;
+/* ================================================================
+   leapfrog_kick   → update kecepatan setengah step
+   leapfrog_drift  → update posisi satu step penuh
+   Skema KDK: Kick(dt/2) → Drift(dt) → hitung_gaya → Kick(dt/2)
+   Keunggulan: time-reversible, konservasi energi jauh lebih baik
+   ================================================================ */
+void leapfrog_kick(Particle *p, int n, double half_dt) {
+    for (int i=0;i<n;i++){
+        p[i].vx += p[i].ax * half_dt;
+        p[i].vy += p[i].ay * half_dt;
+        p[i].vz += p[i].az * half_dt;
+    }
+}
+void leapfrog_drift(Particle *p, int n, double dt) {
+    for (int i=0;i<n;i++){
+        p[i].x += p[i].vx * dt;
+        p[i].y += p[i].vy * dt;
+        p[i].z += p[i].vz * dt;
     }
 }
 
-/* ============================================================
-   MAIN PROGRAM PARALEL
-   ============================================================ */
-int main(int argc, char *argv[])
-{
-    /* ---- Inisialisasi MPI ---- */
+/* ================================================================
+   hitung_energi — total energi sistem (kinetik + potensial)
+   Dijalankan hanya oleh rank 0 pada all_particles.
+   ================================================================ */
+double hitung_energi(const Particle *p, int N) {
+    double E_kin = 0.0, E_pot = 0.0;
+    for (int i=0;i<N;i++){
+        double v2 = p[i].vx*p[i].vx + p[i].vy*p[i].vy + p[i].vz*p[i].vz;
+        E_kin += 0.5 * p[i].mass * v2;
+        for (int j=i+1;j<N;j++){
+            double dx=p[j].x-p[i].x, dy=p[j].y-p[i].y, dz=p[j].z-p[i].z;
+            double r=sqrt(dx*dx+dy*dy+dz*dz+SOFTENING*SOFTENING);
+            E_pot -= G_CONST * p[i].mass * p[j].mass / r;
+        }
+    }
+    return E_kin + E_pot;
+}
+
+/* ================================================================
+   MAIN
+   ================================================================ */
+int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
 
     int rank, n_procs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &n_procs);
 
-    /* ---- Parse parameter ---- */
-    SimParams params;
-    parse_args(argc, argv, &params);
+    /* --- parameter dari argumen atau default --- */
+    int    N        = (argc > 1) ? atoi(argv[1]) : 512;
+    int    N_steps  = (argc > 2) ? atoi(argv[2]) : 200;
+    int    n_thread = (argc > 3) ? atoi(argv[3]) : 1;
+    double dt       = DT_DEF;
+    int    out_freq = 10;
 
-    /* ==============================================================
-       PERBAIKAN: arahkan output trajektori ke ../results/
-       ============================================================== */
-    if (rank == 0) {
-        if (strcmp(params.output_file, "output_trajectory.csv") == 0 ||
-            strncmp(params.output_file, "../results/", 11) != 0) {
-            snprintf(params.output_file, sizeof(params.output_file),
-                     "../results/parallel_trajectory.csv");
-        }
-    }
+    omp_set_num_threads(n_thread);
 
-    int    N  = params.n_particles;
-    int    T  = params.n_steps;
-    double dt = params.dt;
-
-    /* ---- Validasi: N harus habis dibagi n_procs ---- */
     if (N % n_procs != 0) {
-        if (rank == 0) {
-            fprintf(stderr,
-                "[ERROR] N=%d tidak habis dibagi oleh jumlah proses P=%d.\n"
-                "        Pilih N yang merupakan kelipatan %d.\n",
-                N, n_procs, n_procs);
-        }
-        MPI_Finalize();
-        return EXIT_FAILURE;
+        if (rank==0) fprintf(stderr,"[ERROR] N=%d harus habis dibagi P=%d\n",N,n_procs);
+        MPI_Finalize(); return 1;
     }
+    int n_lokal = N / n_procs;
 
-    int n_local = N / n_procs;  /* Partikel per proses */
+    /* --- alokasi --- */
+    Particle *all   = malloc(N       * sizeof(Particle));
+    Particle *lokal = malloc(n_lokal * sizeof(Particle));
 
-    /* ---- Info thread OpenMP ---- */
-    int n_threads = 1;
-    #pragma omp parallel
-    {
-        #pragma omp single
-        n_threads = omp_get_num_threads();
-    }
-
+    /* --- inisialisasi (rank 0 saja) --- */
     if (rank == 0) {
-        printf("\n");
-        printf("╔══════════════════════════════════════════════════════╗\n");
-        printf("║         Simulasi N-Body Paralel (MPI + OpenMP)       ║\n");
-        printf("╠══════════════════════════════════════════════════════╣\n");
-        printf("║  Partikel (N)       : %-31d ║\n", N);
-        printf("║  Timestep (T)       : %-31d ║\n", T);
-        printf("║  dt                 : %-31.4f ║\n", dt);
-        printf("║  Proses MPI (P)     : %-31d ║\n", n_procs);
-        printf("║  Thread OpenMP/rank : %-31d ║\n", n_threads);
-        printf("║  Total core logis   : %-31d ║\n", n_procs * n_threads);
-        printf("║  Partikel per rank  : %-31d ║\n", n_local);
-        printf("╚══════════════════════════════════════════════════════╝\n\n");
+        inisialisasi_plummer(all, N, 42);
+        printf("╔══════════════════════════════════════════════════╗\n");
+        printf("║   N-Body Paralel — FIXED (MPI + OpenMP)          ║\n");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║  N partikel      : %-29d ║\n", N);
+        printf("║  N steps         : %-29d ║\n", N_steps);
+        printf("║  dt (adimensional): %-28.4f ║\n", dt);
+        printf("║  MPI proses      : %-29d ║\n", n_procs);
+        printf("║  OpenMP threads  : %-29d ║\n", n_thread);
+        printf("║  Softening ε     : %-29.3f ║\n", SOFTENING);
+        printf("╚══════════════════════════════════════════════════╝\n\n");
     }
 
-    /* ---- Alokasi memori ---- */
-    /* Semua partikel (inisialisasi di rank 0, lalu di-broadcast) */
-    Particle *all_particles   = (Particle *)malloc(N * sizeof(Particle));
-    /* Partikel lokal milik rank ini */
-    Particle *local_particles = (Particle *)malloc(n_local * sizeof(Particle));
-    /* Buffer flat untuk komunikasi MPI */
-    ParticleFlat *flat_all   = (ParticleFlat *)malloc(N * sizeof(ParticleFlat));
-    ParticleFlat *flat_local = (ParticleFlat *)malloc(n_local * sizeof(ParticleFlat));
-
-    if (!all_particles || !local_particles || !flat_all || !flat_local) {
-        fprintf(stderr, "[RANK %d ERROR] Gagal alokasi memori\n", rank);
-        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-    }
-
-    /* ---- Inisialisasi partikel (hanya rank 0) ---- */
-    if (rank == 0) {
-        init_particles(all_particles, N, params.seed);
-        printf("[INFO] Rank 0: inisialisasi %d partikel selesai\n", N);
-    }
-
-    /* ---- Broadcast semua partikel ke semua rank ----
-     * Kita broadcast struct langsung (karena compiler sama, padding sama).
-     * Untuk portabilitas produksi, gunakan MPI derived type atau serialisasi.
-     */
-    MPI_Bcast(all_particles, N * sizeof(Particle), MPI_BYTE,
-              0, MPI_COMM_WORLD);
-
-    /* ---- Distribusi partikel lokal ke masing-masing rank ----
-     * Rank 0 scatter, setiap rank menerima slice n_local partikel
-     */
-    MPI_Scatter(all_particles,   n_local * sizeof(Particle), MPI_BYTE,
-                local_particles, n_local * sizeof(Particle), MPI_BYTE,
+    /* broadcast dan scatter */
+    MPI_Bcast(all, N * sizeof(Particle), MPI_BYTE, 0, MPI_COMM_WORLD);
+    MPI_Scatter(all,   n_lokal * sizeof(Particle), MPI_BYTE,
+                lokal, n_lokal * sizeof(Particle), MPI_BYTE,
                 0, MPI_COMM_WORLD);
 
-    /* ---- Hitung energi awal (rank 0 saja) ---- */
-    Energy E_init = {0.0, 0.0, 0.0};
+    /* Energi awal */
+    double E0 = 0.0;
     if (rank == 0) {
-        E_init = compute_energy(all_particles, N);
-        printf("[VALIDASI] Energi awal: E_tot = %.6e J\n", E_init.total);
+        E0 = hitung_energi(all, N);
+        printf("Energi awal E0 = %.6e\n\n", E0);
+        printf("  %-6s  %-14s  %-14s  %-14s  %-10s\n",
+               "Step","E_kin","E_pot","E_tot","ΔE/E0 (%)");
+        printf("  %s\n", "──────────────────────────────────────────────────────────");
     }
-    /* Broadcast energi awal ke semua rank untuk validasi lokal */
-    MPI_Bcast(&E_init, sizeof(Energy), MPI_BYTE, 0, MPI_COMM_WORLD);
-
-    /* ---- Buka file output (rank 0 saja) ---- */
-    FILE *fp_out = NULL;
-    if (rank == 0) {
-        fp_out = fopen(params.output_file, "w");
-        if (fp_out) {
-            fprintf(fp_out, "step,time,particle_id,x,y,z,vx,vy,vz,mass\n");
-            save_state(fp_out, all_particles, N, 0, 0.0);
-        }
-    }
+    MPI_Bcast(&E0, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     /* ================================================================
-       MAIN LOOP SIMULASI PARALEL
+       Hitung akselerasi awal sebelum loop (butuh untuk KDK pertama)
        ================================================================ */
+    hitung_akselerasi_omp(lokal, n_lokal, all, N);
+    MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
+                  all,   n_lokal * sizeof(Particle), MPI_BYTE,
+                  MPI_COMM_WORLD);
+
     MPI_Barrier(MPI_COMM_WORLD);
-    double t_start_total = MPI_Wtime();
-    double t_force_total = 0.0;
-    double t_comm_total  = 0.0;
-    double t_integ_total = 0.0;
+    double t_start = MPI_Wtime();
+    double t_force=0, t_comm=0, t_integ=0;
 
-    if (rank == 0) {
-        printf("\n[SIMULASI] Mulai %d timestep...\n", T);
-        printf("─────────────────────────────────────────────────────────────────\n");
-    }
+    /* ================================================================
+       MAIN LOOP — Leapfrog KDK
+       K = Kick (update v setengah step)
+       D = Drift (update posisi penuh)
+       K = Kick (update v setengah step lagi)
+       ================================================================ */
+    for (int step = 1; step <= N_steps; step++) {
 
-    for (int step = 1; step <= T; step++) {
-        double sim_time = step * dt;
-
-        /* ============================================================
-           FASE 1: Hitung gaya (MPI x OpenMP)
-           - Tiap rank menghitung gaya lokal terhadap SEMUA partikel global
-           - OpenMP parallelkan loop partikel lokal
-           ============================================================ */
+        /* --- KICK pertama: v += a * dt/2 --- */
         double t0 = MPI_Wtime();
-        compute_forces_parallel_omp(local_particles, n_local,
-                                    all_particles, N);
-        double t1 = MPI_Wtime();
-        t_force_total += (t1 - t0);
+        leapfrog_kick(lokal, n_lokal, 0.5 * dt);
 
-        /* ============================================================
-           FASE 2: Update posisi & kecepatan lokal (Velocity Verlet)
-           ============================================================ */
-        double t2 = MPI_Wtime();
-        update_local(local_particles, n_local, dt);
-        double t3 = MPI_Wtime();
-        t_integ_total += (t3 - t2);
+        /* --- DRIFT: x += v * dt --- */
+        leapfrog_drift(lokal, n_lokal, dt);
+        t_integ += MPI_Wtime() - t0;
 
-        /* ============================================================
-           FASE 3: Sinkronisasi global (MPI_Allgather)
-           - Setiap rank mengirim partikel lokalnya
-           - Semua rank menerima semua partikel (global state diperbarui)
-           ============================================================ */
-        double t4 = MPI_Wtime();
-        MPI_Allgather(local_particles, n_local * sizeof(Particle), MPI_BYTE,
-                      all_particles,  n_local * sizeof(Particle), MPI_BYTE,
+        /* --- KOMUNIKASI: kumpulkan posisi baru ke semua rank --- */
+        t0 = MPI_Wtime();
+        MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
+                      all,   n_lokal * sizeof(Particle), MPI_BYTE,
                       MPI_COMM_WORLD);
-        double t5 = MPI_Wtime();
-        t_comm_total += (t5 - t4);
+        t_comm += MPI_Wtime() - t0;
 
-        /* ============================================================
-           FASE 4: Output dan validasi (rank 0 saja)
-           ============================================================ */
-        if (step % params.output_freq == 0 || step == T) {
+        /* --- Hitung akselerasi baru (dengan posisi yang sudah di-drift) --- */
+        t0 = MPI_Wtime();
+        hitung_akselerasi_omp(lokal, n_lokal, all, N);
+        t_force += MPI_Wtime() - t0;
+
+        /* --- KICK kedua: v += a_baru * dt/2 --- */
+        t0 = MPI_Wtime();
+        leapfrog_kick(lokal, n_lokal, 0.5 * dt);
+        t_integ += MPI_Wtime() - t0;
+
+        /* --- Output & validasi energi --- */
+        if (step % out_freq == 0 || step == N_steps) {
+            /* Kumpulkan partikel final dulu */
+            MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
+                          all,   n_lokal * sizeof(Particle), MPI_BYTE,
+                          MPI_COMM_WORLD);
             if (rank == 0) {
-                double elapsed = MPI_Wtime() - t_start_total;
-                Energy E_now = compute_energy(all_particles, N);
-                print_energy(step, E_now, elapsed);
-
-                /* Validasi konservasi energi */
-                if (!validate_energy_conservation(E_init.total, E_now.total, 0.05)) {
-                    printf("  [WARNING] Energi menyimpang >5%% pada step %d!\n", step);
+                double E_kin=0, E_pot=0;
+                for(int i=0;i<N;i++){
+                    double v2=all[i].vx*all[i].vx+all[i].vy*all[i].vy+all[i].vz*all[i].vz;
+                    E_kin+=0.5*all[i].mass*v2;
                 }
-
-                if (fp_out) save_state(fp_out, all_particles, N, step, sim_time);
+                /* potensial hanya sample O(N) biar cepat untuk monitoring */
+                for(int i=0;i<N;i++)
+                    for(int j=i+1;j<N;j++){
+                        double dx=all[j].x-all[i].x,dy=all[j].y-all[i].y,dz=all[j].z-all[i].z;
+                        double r=sqrt(dx*dx+dy*dy+dz*dz+SOFTENING*SOFTENING);
+                        E_pot -= G_CONST*all[i].mass*all[j].mass/r;
+                    }
+                double E_tot = E_kin + E_pot;
+                double dE    = (E_tot - E0) / fabs(E0) * 100.0;
+                printf("  %-6d  %-14.4e  %-14.4e  %-14.4e  %+.4f%%\n",
+                       step, E_kin, E_pot, E_tot, dE);
             }
         }
     }
 
-    /* ---- Barrier untuk sinkronisasi waktu akhir ---- */
     MPI_Barrier(MPI_COMM_WORLD);
-    double t_total = MPI_Wtime() - t_start_total;
+    double t_total = MPI_Wtime() - t_start;
 
-    /* ---- Agregasi statistik waktu dari semua rank ---- */
-    double t_force_max, t_comm_max, t_integ_max;
-    MPI_Reduce(&t_force_total, &t_force_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&t_comm_total,  &t_comm_max,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&t_integ_total, &t_integ_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    /* Agregasi waktu */
+    double tf_max, tc_max, ti_max;
+    MPI_Reduce(&t_force, &tf_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_comm,  &tc_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&t_integ, &ti_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    /* ---- Cetak ringkasan (rank 0) ---- */
     if (rank == 0) {
-        Energy E_final = compute_energy(all_particles, N);
-        double rel_err = fabs((E_final.total - E_init.total) / E_init.total) * 100.0;
-
-        printf("─────────────────────────────────────────────────────────────────\n");
-        printf("\n[HASIL AKHIR]\n");
-        printf("  Energi awal  : %.6e J\n", E_init.total);
-        printf("  Energi akhir : %.6e J\n", E_final.total);
-        printf("  Error relatif: %.4f %%\n", rel_err);
-        if (validate_energy_conservation(E_init.total, E_final.total, 0.05))
-            printf("  Status       : VALID (konservasi energi terjaga)\n");
-        else
-            printf("  Status       : PERINGATAN (energi menyimpang)\n");
-
-        printf("\n[PROFIL WAKTU PARALEL (rank terlambat)]\n");
-        printf("  Total waktu    : %.4f detik\n", t_total);
-        printf("  Waktu gaya     : %.4f detik (%.1f%%)\n",
-               t_force_max, 100.0 * t_force_max / t_total);
-        printf("  Waktu komunikasi: %.4f detik (%.1f%%)\n",
-               t_comm_max, 100.0 * t_comm_max / t_total);
-        printf("  Waktu integrasi: %.4f detik (%.1f%%)\n",
-               t_integ_max, 100.0 * t_integ_max / t_total);
-        printf("  Throughput     : %.2f partikel-pasang/detik\n",
-               (double)N * (double)N * T / t_total);
-        printf("  Konfigurasi    : %d MPI proses x %d thread = %d core\n",
-               n_procs, n_threads, n_procs * n_threads);
-
-        /* ============================================================
-           PERBAIKAN: simpan timing ke ../results/
-           ============================================================ */
-        FILE *fp_time = fopen("../results/parallel_timing.txt", "w");
-        if (fp_time) {
-            fprintf(fp_time, "mode=parallel\n");
-            fprintf(fp_time, "N=%d\n", N);
-            fprintf(fp_time, "T=%d\n", T);
-            fprintf(fp_time, "mpi_procs=%d\n", n_procs);
-            fprintf(fp_time, "omp_threads=%d\n", n_threads);
-            fprintf(fp_time, "total_time=%.6f\n", t_total);
-            fprintf(fp_time, "force_time=%.6f\n", t_force_max);
-            fprintf(fp_time, "comm_time=%.6f\n", t_comm_max);
-            fprintf(fp_time, "energy_error_pct=%.6f\n", rel_err);
-            fclose(fp_time);
-            printf("\n[INFO] Timing disimpan ke: ../results/parallel_timing.txt\n");
-        }
-
-        if (fp_out) {
-            fclose(fp_out);
-            printf("[INFO] Trajektori disimpan ke: %s\n", params.output_file);
-        }
+        double E_final = hitung_energi(all, N);
+        double dE_pct  = (E_final - E0) / fabs(E0) * 100.0;
+        printf("\n╔══════════════════════════════════════════════════╗\n");
+        printf("║  HASIL AKHIR                                     ║\n");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║  Energi awal      : %-28.4e ║\n", E0);
+        printf("║  Energi akhir     : %-28.4e ║\n", E_final);
+        printf("║  Error ΔE/E₀      : %-27.4f%% ║\n", dE_pct);
+        printf("║  Status           : %-28s ║\n",
+               fabs(dE_pct)<1.0 ? "STABIL ✓ (<1%)" : fabs(dE_pct)<5.0 ?
+               "OK (<5%)" : "PERINGATAN (>5%)");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║  PROFIL WAKTU                                    ║\n");
+        printf("╠══════════════════════════════════════════════════╣\n");
+        printf("║  Total            : %-28.4f ║\n", t_total);
+        printf("║  Hitung gaya      : %.4f s (%.1f%%)%*s║\n",
+               tf_max, 100.*tf_max/t_total,
+               (int)(18-snprintf(NULL,0,"%.4f s (%.1f%%)",tf_max,100.*tf_max/t_total)),"");
+        printf("║  Komunikasi MPI   : %.4f s (%.1f%%)%*s║\n",
+               tc_max, 100.*tc_max/t_total,
+               (int)(18-snprintf(NULL,0,"%.4f s (%.1f%%)",tc_max,100.*tc_max/t_total)),"");
+        printf("║  Integrasi        : %.4f s (%.1f%%)%*s║\n",
+               ti_max, 100.*ti_max/t_total,
+               (int)(18-snprintf(NULL,0,"%.4f s (%.1f%%)",ti_max,100.*ti_max/t_total)),"");
+        printf("╚══════════════════════════════════════════════════╝\n");
     }
 
-    /* ---- Bersihkan memori ---- */
-    free(all_particles);
-    free(local_particles);
-    free(flat_all);
-    free(flat_local);
-
+    free(all); free(lokal);
     MPI_Finalize();
-
-    if (rank == 0)
-        printf("\n[SELESAI] Simulasi paralel berhasil.\n\n");
-
-    return EXIT_SUCCESS;
+    return 0;
 }
