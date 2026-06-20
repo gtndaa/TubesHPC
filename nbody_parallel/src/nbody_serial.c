@@ -36,7 +36,7 @@ int main(int argc, char *argv[])
 
     /* Override nama file output agar tidak konflik dengan paralel */
     if (strcmp(params.output_file, "output_trajectory.csv") == 0)
-        strncpy(params.output_file, "serial_trajectory.csv",
+        strncpy(params.output_file, "../results/serial_trajectory.csv",
                 sizeof(params.output_file)-1);
 
     print_params(&params, "SERIAL (single-core, no MPI/OpenMP)");
@@ -145,7 +145,7 @@ int main(int argc, char *argv[])
            (double)N * (N-1) / 2.0 * T / t_total);
 
     /* ---- Simpan waktu ke file untuk perbandingan ---- */
-    FILE *fp_time = fopen("../result/serial_timing.txt", "w");
+    FILE *fp_time = fopen("../results/serial_timing.txt", "w");
     if (fp_time) {
         fprintf(fp_time, "mode=serial\n");
         fprintf(fp_time, "N=%d\n", N);
@@ -154,7 +154,7 @@ int main(int argc, char *argv[])
         fprintf(fp_time, "force_time=%.6f\n", t_force_total);
         fprintf(fp_time, "energy_error_pct=%.6f\n", rel_err);
         fclose(fp_time);
-        printf("\n[INFO] Timing disimpan ke: serial_timing.txt\n");
+        printf("\n[INFO] Timing disimpan ke: ../results/serial_timing.txt\n");
     }
 
     if (fp_out) {

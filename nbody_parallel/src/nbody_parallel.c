@@ -173,6 +173,17 @@ int main(int argc, char *argv[])
     SimParams params;
     parse_args(argc, argv, &params);
 
+    /* ==============================================================
+       PERBAIKAN: arahkan output trajektori ke ../results/
+       ============================================================== */
+    if (rank == 0) {
+        if (strcmp(params.output_file, "output_trajectory.csv") == 0 ||
+            strncmp(params.output_file, "../results/", 11) != 0) {
+            snprintf(params.output_file, sizeof(params.output_file),
+                     "../results/parallel_trajectory.csv");
+        }
+    }
+
     int    N  = params.n_particles;
     int    T  = params.n_steps;
     double dt = params.dt;
@@ -372,8 +383,10 @@ int main(int argc, char *argv[])
         printf("  Konfigurasi    : %d MPI proses x %d thread = %d core\n",
                n_procs, n_threads, n_procs * n_threads);
 
-        /* Simpan timing untuk perbandingan */
-        FILE *fp_time = fopen("../result/parallel_timing.txt", "w");
+        /* ============================================================
+           PERBAIKAN: simpan timing ke ../results/
+           ============================================================ */
+        FILE *fp_time = fopen("../results/parallel_timing.txt", "w");
         if (fp_time) {
             fprintf(fp_time, "mode=parallel\n");
             fprintf(fp_time, "N=%d\n", N);
@@ -385,7 +398,7 @@ int main(int argc, char *argv[])
             fprintf(fp_time, "comm_time=%.6f\n", t_comm_max);
             fprintf(fp_time, "energy_error_pct=%.6f\n", rel_err);
             fclose(fp_time);
-            printf("\n[INFO] Timing disimpan ke: parallel_timing.txt\n");
+            printf("\n[INFO] Timing disimpan ke: ../results/parallel_timing.txt\n");
         }
 
         if (fp_out) {
