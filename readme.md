@@ -18,7 +18,11 @@ Simulasi N-Body gravitasi dalam dua mode:
 Jalankan:
 
 ```bash
-make
+# compile serial
+gcc -O2 -o nbody_serial nbody_serial.c nbody_utils.c -lm
+
+#compile paralel
+mpicc -O2 -fopenmp -o nbody_parallel nbody_parallel.c nbody_utils.c -lm
 ```
 
 Hasil build:
@@ -45,8 +49,8 @@ Parameter:
 
 Contoh output:
 
-* `result/serial_trajectory.csv`
-* `result/serial_timing.txt`
+* `results/serial_trajectory.csv`
+* `results/serial_timing.txt`
 
 ## Menjalankan Versi Paralel
 
@@ -63,24 +67,18 @@ Keterangan:
 
 Contoh output:
 
-* `result/parallel_trajectory.csv`
-* `result/parallel_timing.txt`
+* `results/parallel_trajectory.csv`
+* `results/parallel_timing.txt`
 
 ## Melihat Hasil
 
-File hasil ada di folder `result/`.
+File hasil ada di folder `results/`.
 
 Biasanya yang dicek:
 
 * trajektori partikel (`*.csv`)
 * waktu eksekusi (`*_timing.txt`)
 * grafik dari script di `scripts/`
-
-## Membersihkan Build
-
-```bash
-make clean
-```
 
 ## Catatan
 

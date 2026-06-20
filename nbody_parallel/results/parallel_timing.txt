@@ -1,0 +1,9 @@
+mode=parallel
+N=256
+T=50
+mpi_procs=2
+omp_threads=4
+total_time=0.040211
+force_time=0.017631
+comm_time=0.017979
+energy_error_pct=10.844466

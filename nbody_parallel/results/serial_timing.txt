@@ -1,0 +1,6 @@
+mode=serial
+N=256
+T=100
+total_time=0.077929
+force_time=0.040742
+energy_error_pct=51678.593974
