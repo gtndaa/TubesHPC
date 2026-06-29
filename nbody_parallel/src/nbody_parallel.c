@@ -6,7 +6,7 @@
  *   mpirun --oversubscribe --allow-run-as-root \
  *          --mca plm_rsh_agent "" -np 4 \
  *          ./nbody_parallel 512 200 4
- *   (arg: N_partikel  N_steps  N_threads)
+ *   (arg: N_particle  N_steps  N_threads)
  */
 
 #include <stdio.h>
@@ -16,12 +16,12 @@
 #include <mpi.h>
 #include <omp.h>
 
-/* Adimensional constants */
-#define G_CONST   1.0      /* gravitasi adimensional                    */
-#define SOFTENING 0.05     /* ~5% dari radius sistem, cegah singularity */
-#define DT_DEF    0.001    /* timestep untuk unit adimensional          */
+// Adimensional constants
+#define G_CONST   1.0      // gravitasi adimensional
+#define SOFTENING 0.05     // ~5% dari radius sistem, cegah singularity
+#define DT_DEF    0.001    // timestep untuk unit adimensional
 
-/* Particle structure */
+// Particle structure
 typedef struct {
     double x,  y,  z;
     double vx, vy, vz;
@@ -29,13 +29,13 @@ typedef struct {
     double mass;
 } Particle;
 
-/* Plummer initialize: to distribute galaxy particles */
+// Plummer initialize: to distribute galaxy particles
 void inisialisasi_plummer(Particle *p, int N, unsigned int seed) {
     srand(seed);
     double inv_N = 1.0 / N;
 
     for (int i = 0; i < N; i++) {
-        /* Inverse CDF: r = 1/sqrt(u^(-2/3) - 1), u ~ Uniform(0,1)*/
+        // Inverse CDF: r = 1/sqrt(u^(-2/3) - 1), u ~ Uniform(0,1)
         double u   = 0.001 + 0.998 * ((double)rand() / RAND_MAX);
         double r   = 1.0 / sqrt(pow(u, -2.0/3.0) - 1.0);
         double cos_theta = 2.0 * ((double)rand() / RAND_MAX) - 1.0;
@@ -46,11 +46,11 @@ void inisialisasi_plummer(Particle *p, int N, unsigned int seed) {
         p[i].y = r * sin_theta * sin(phi);
         p[i].z = r * cos_theta;
 
-        /* v_esc = sqrt(2 * |phi(r)|), phi(r) = -G*M/sqrt(r²+1) */
+        // v_esc = sqrt(2 * |phi(r)|), phi(r) = -G*M/sqrt(r²+1)
         double phi_r = -G_CONST * N / sqrt(r*r + 1.0);
         double v_max = sqrt(2.0 * fabs(phi_r)) * 0.5;
 
-        /* rejection sampling for velocity distribution */
+        // rejection sampling for velocity distribution
         double v, g;
         do {
             v = ((double)rand() / RAND_MAX) * v_max;
@@ -68,10 +68,10 @@ void inisialisasi_plummer(Particle *p, int N, unsigned int seed) {
         p[i].ax   = 0.0;
         p[i].ay   = 0.0;
         p[i].az   = 0.0;
-        p[i].mass = 1.0;   /* adimensional mass */
+        p[i].mass = 1.0;   // adimensional mass
     }
 
-    /* Center of mass correction: shift to zero */
+    // Center of mass correction: shift to zero
     double cx=0,cy=0,cz=0, cvx=0,cvy=0,cvz=0;
     for (int i=0;i<N;i++){cx+=p[i].x;cy+=p[i].y;cz+=p[i].z;
                           cvx+=p[i].vx;cvy+=p[i].vy;cvz+=p[i].vz;}
@@ -83,7 +83,7 @@ void inisialisasi_plummer(Particle *p, int N, unsigned int seed) {
     }
 }
 
-/* Local acceleration calculation */
+// Local acceleration calculation
 void hitung_akselerasi_omp(Particle *lokal, int n_lokal,
                             const Particle *global, int N)
 {
@@ -96,7 +96,6 @@ void hitung_akselerasi_omp(Particle *lokal, int n_lokal,
             double dy = global[j].y - lokal[i].y;
             double dz = global[j].z - lokal[i].z;
             double r2 = dx*dx + dy*dy + dz*dz + SOFTENING*SOFTENING;
-            /* skip self secara efisien lewat softening (tidak perlu cek eksplisit) */
             double inv_r3 = 1.0 / (r2 * sqrt(r2));
             double fac = G_CONST * global[j].mass * inv_r3;
             ax += fac * dx;
@@ -109,7 +108,7 @@ void hitung_akselerasi_omp(Particle *lokal, int n_lokal,
     }
 }
 
-/* Leapfrog Integration with KDK scheme
+/*   Leapfrog Integration with KDK scheme
    → leapfrog_kick: update velocity of half step
    → leapfrog_drift: update position of full step */
 void leapfrog_kick(Particle *p, int n, double half_dt) {
@@ -127,7 +126,7 @@ void leapfrog_drift(Particle *p, int n, double dt) {
     }
 }
 
-/* Energy calculation */
+// Energy calculation
 double hitung_energi(const Particle *p, int N) {
     double E_kin = 0.0, E_pot = 0.0;
     for (int i=0;i<N;i++){
@@ -142,7 +141,7 @@ double hitung_energi(const Particle *p, int N) {
     return E_kin + E_pot;
 }
 
-/* Main function */
+// Main function
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
 
@@ -150,7 +149,7 @@ int main(int argc, char **argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &n_procs);
 
-    /* default parameters */
+    // default parameters
     int    N        = (argc > 1) ? atoi(argv[1]) : 512;
     int    N_steps  = (argc > 2) ? atoi(argv[2]) : 200;
     int    n_thread = (argc > 3) ? atoi(argv[3]) : 1;
@@ -165,11 +164,11 @@ int main(int argc, char **argv) {
     }
     int n_lokal = N / n_procs;
 
-    /* memory allocation */
+    // memory allocation
     Particle *all   = malloc(N       * sizeof(Particle));
     Particle *lokal = malloc(n_lokal * sizeof(Particle));
 
-    /* initialization */
+    // initialization
     if (rank == 0) {
         inisialisasi_plummer(all, N, 42);
         printf("N-Body Paralel  (MPI + OpenMP Implementation)\n");
@@ -181,13 +180,13 @@ int main(int argc, char **argv) {
         printf("Softening ε\t\t: %-29.3f \n\n", SOFTENING);
     }
 
-    /* broadcast dan scatter */
+    // broadcast dan scatter
     MPI_Bcast(all, N * sizeof(Particle), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Scatter(all,   n_lokal * sizeof(Particle), MPI_BYTE,
                 lokal, n_lokal * sizeof(Particle), MPI_BYTE,
                 0, MPI_COMM_WORLD);
 
-    /* initial energy */
+    // initial energy
     double E0 = 0.0;
     if (rank == 0) {
         E0 = hitung_energi(all, N);
@@ -198,7 +197,7 @@ int main(int argc, char **argv) {
     }
     MPI_Bcast(&E0, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    /* initial acceleration */
+    // initial acceleration
     hitung_akselerasi_omp(lokal, n_lokal, all, N);
     MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
                   all,   n_lokal * sizeof(Particle), MPI_BYTE,
@@ -208,37 +207,37 @@ int main(int argc, char **argv) {
     double t_start = MPI_Wtime();
     double t_force=0, t_comm=0, t_integ=0;
 
-    /* KDK loop */
+    // KDK loop
     for (int step = 1; step <= N_steps; step++) {
 
-        /* first Kick v += a * dt/2 */
+        // first Kick v += a * dt/2
         double t0 = MPI_Wtime();
         leapfrog_kick(lokal, n_lokal, 0.5 * dt);
 
-        /* drift x += v * dt */
+        // drift x += v * dt
         leapfrog_drift(lokal, n_lokal, dt);
         t_integ += MPI_Wtime() - t0;
 
-        /* MPI communication */
+        // MPI communication
         t0 = MPI_Wtime();
         MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
                       all,   n_lokal * sizeof(Particle), MPI_BYTE,
                       MPI_COMM_WORLD);
         t_comm += MPI_Wtime() - t0;
 
-        /* update acceleration */
+        // update acceleration
         t0 = MPI_Wtime();
         hitung_akselerasi_omp(lokal, n_lokal, all, N);
         t_force += MPI_Wtime() - t0;
 
-        /* second Kick: v += a_baru * dt/2 */
+        // second Kick: v += a_baru * dt/2
         t0 = MPI_Wtime();
         leapfrog_kick(lokal, n_lokal, 0.5 * dt);
         t_integ += MPI_Wtime() - t0;
 
-        /* validation */
+        // validation
         if (step % out_freq == 0 || step == N_steps) {
-            /* collect all particles */
+            // collect all particles
             MPI_Allgather(lokal, n_lokal * sizeof(Particle), MPI_BYTE,
                           all,   n_lokal * sizeof(Particle), MPI_BYTE,
                           MPI_COMM_WORLD);
@@ -265,7 +264,7 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t_total = MPI_Wtime() - t_start;
 
-    /* time aggregation */
+    // time aggregation
     double tf_max, tc_max, ti_max;
     MPI_Reduce(&t_force, &tf_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_comm,  &tc_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
